@@ -5,8 +5,17 @@ from pathlib import Path
 
 import pandas as pd
 import requests
-
-from app.eda_engine import load_dataset, profile_dataset
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from app.eda_engine import (
+    load_dataset,
+    profile_dataset,
+    analyze_missing_values,
+    analyze_numeric_columns,
+    detect_outliers,
+    analyze_correlations,
+)
+from app.visualizations import generate_visualizations
 
 
 OLLAMA_URL = os.getenv(
@@ -190,30 +199,149 @@ def create_analysis_plan(df: pd.DataFrame) -> dict:
     )
 
 
+class EDAState(TypedDict, total=False):
+    """Shared state passed between LangGraph nodes."""
+
+    df: pd.DataFrame
+    dataset_path: str
+    output_dir: str
+    plan: dict
+    results: dict
+    error: str
+
+
+def planning_node(state: EDAState) -> dict:
+    """Ask the LLM to create a validated analysis plan."""
+
+    try:
+        plan = create_analysis_plan(state["df"])
+        return {"plan": plan, "error": ""}
+    except Exception as exc:
+        return {"error": f"Planning failed: {exc}"}
+
+
+def execution_node(state: EDAState) -> dict:
+    """Execute only the analysis tools approved in the plan."""
+
+    if state.get("error"):
+        return {}
+
+    df = state["df"]
+    output_dir = Path(state["output_dir"])
+
+    tool_functions = {
+        "analyze_missing_values": lambda: analyze_missing_values(df),
+        "analyze_numeric_columns": lambda: analyze_numeric_columns(df),
+        "detect_outliers": lambda: detect_outliers(df),
+        "analyze_correlations": lambda: analyze_correlations(df),
+        "generate_visualizations": lambda: generate_visualizations(
+            df, output_dir=output_dir
+        ),
+    }
+
+    results = {}
+
+    for step in state["plan"]["plan"]:
+        tool_name = step["tool"]
+
+        # Defense in depth: never execute an unknown tool.
+        if tool_name not in ALLOWED_TOOLS:
+            continue
+
+        if tool_name not in tool_functions:
+            continue
+
+        try:
+            results[tool_name] = tool_functions[tool_name]()
+        except Exception as exc:
+            # Record the failure and continue with other tools.
+            results[tool_name] = {
+                "error": str(exc)
+            }
+
+    return {"results": results}
+
+
+def build_eda_graph():
+    """Build the initial plan-and-execute LangGraph workflow."""
+
+    workflow = StateGraph(EDAState)
+
+    workflow.add_node("plan", planning_node)
+    workflow.add_node("execute", execution_node)
+
+    workflow.add_edge(START, "plan")
+
+    # Skip execution if planning failed.
+    workflow.add_conditional_edges(
+        "plan",
+        lambda state: (
+            "stop" if state.get("error") else "continue"
+        ),
+        {
+            "stop": END,
+            "continue": "execute",
+        },
+    )
+
+    workflow.add_edge("execute", END)
+
+    return workflow.compile()
+
+
+def run_agent(dataset_path: str | Path) -> dict:
+    """Run the complete EDA agent workflow on a dataset."""
+
+    project_root = Path(__file__).resolve().parent.parent
+    dataset_path = Path(dataset_path).resolve()
+
+    df = load_dataset(dataset_path)
+
+    graph = build_eda_graph()
+
+    initial_state: EDAState = {
+        "df": df,
+        "dataset_path": str(dataset_path),
+        "output_dir": str(project_root / "reports" / "charts"),
+        "plan": {},
+        "results": {},
+        "error": "",
+    }
+
+    return graph.invoke(initial_state)
+
 if __name__ == "__main__":
     project_root = Path(__file__).resolve().parent.parent
     dataset_path = project_root / "data" / "customers.csv"
 
-    if not dataset_path.exists():
-        raise FileNotFoundError(
-            f"Place the sample dataset at: {dataset_path}"
-        )
-
-    dataset = load_dataset(dataset_path)
-    print("Dataset loaded successfully.")
-    print(f"Connecting to Ollama model: {OLLAMA_MODEL}")
+    print("Loading dataset and starting the EDA agent...")
 
     try:
-        analysis_plan = create_analysis_plan(dataset)
+        final_state = run_agent(dataset_path)
 
-        print("\n========== AI ANALYSIS PLAN ==========")
-        print(json.dumps(analysis_plan, indent=2))
+        if final_state.get("error"):
+            print("\n========== AGENT ERROR ==========")
+            print(final_state["error"])
+        else:
+            print("\n========== AI ANALYSIS PLAN ==========")
+            print(json.dumps(final_state["plan"], indent=2))
 
-    except requests.RequestException as exc:
-        print("\nCould not connect to Ollama.")
-        print("Check that Ollama is running and the model is installed.")
-        print(f"Details: {exc}")
+            print("\n========== EXECUTION RESULTS ==========")
 
-    except (ValueError, KeyError, json.JSONDecodeError) as exc:
-        print("\nCould not create a valid analysis plan.")
-        print(f"Details: {exc}")
+            for tool_name, result in final_state.get(
+                "results", {}
+            ).items():
+                print(f"\n--- {tool_name} ---")
+
+                if isinstance(result, pd.DataFrame):
+                    print(result.to_string(index=False))
+                elif isinstance(result, list):
+                    for item in result:
+                        print(item)
+                else:
+                    print(json.dumps(result, indent=2, default=str))
+
+            print("\nEDA agent workflow completed.")
+
+    except Exception as exc:
+        print(f"\nThe EDA workflow failed: {exc}")
