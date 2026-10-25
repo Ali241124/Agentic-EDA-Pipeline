@@ -1,0 +1,31 @@
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables and secrets
+.env
+.env.*
+
+# IDE and OS files
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Generated reports
+reports/*
+!reports/.gitkeep
+
+# Local datasets (don't publish user data)
+data/*
+!data/.gitkeep
+
+# Test and cache files
+.pytest_cache/
+.coverage
